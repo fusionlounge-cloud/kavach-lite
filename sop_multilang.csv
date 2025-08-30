@@ -1,0 +1,34 @@
+language,category,examples,required,min_count,weight
+en,Greeting,good evening sir,1,1,2
+en,Introduction,my name is Pabitra,1,1,2
+en,Menu Offering,here is the menu,1,1,1
+en,Assistance Bell,if you need something use the bell and i will come over,1,1,1
+en,Gift Offering,here is a small gift for you,0,1,1
+en,Polite Closing,have a good time,1,1,1
+hi,Greeting,नमस्ते,1,1,2
+hi,Introduction,मेरा नाम पबित्रा है,1,1,2
+hi,Menu Offering,यह रहा मेन्यू,1,1,1
+hi,Assistance Bell,अगर आपको कुछ चाहिए तो बेल का उपयोग करें मैं आ जाऊँगा,1,1,1
+hi,Gift Offering,यह आपके लिए एक छोटा सा उपहार है,0,1,1
+hi,Polite Closing,आपका समय शुभ हो,1,1,1
+kn,Greeting,ನಮಸ್ಕಾರ,1,1,2
+kn,Menu Offering,ಇದು ಮೆನು,1,1,1
+kn,Polite Closing,ಒಳ್ಳೆಯ ಸಮಯ ಕಳೆಯಿರಿ,1,1,1
+te,Greeting,నమస్కారం,1,1,2
+te,Menu Offering,ఇది మెనూ,1,1,1
+te,Polite Closing,మంచి సమయం గడపండి,1,1,1
+ta,Greeting,வணக்கம்,1,1,2
+ta,Menu Offering,இது மெனு,1,1,1
+ta,Polite Closing,நல்ல நேரம் கழியுங்கள்,1,1,1
+ml,Greeting,നമസ്കാരം,1,1,2
+ml,Menu Offering,ഇതാണ് മെനു,1,1,1
+ml,Polite Closing,നല്ല സമയം ചിലവഴിക്കൂ,1,1,1
+ar,Greeting,مرحبا,1,1,2
+ar,Menu Offering,هذه هي القائمة,1,1,1
+ar,Polite Closing,أتمنى لك وقتاً طيباً,1,1,1
+fr,Greeting,bonjour,1,1,2
+fr,Menu Offering,voici le menu,1,1,1
+fr,Polite Closing,passez un bon moment,1,1,1
+es,Greeting,hola,1,1,2
+es,Menu Offering,aquí está el menú,1,1,1
+es,Polite Closing,que lo pases bien,1,1,1

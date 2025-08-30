@@ -1,0 +1,7 @@
+category,required,min_needed,weight,examples
+Greeting,1,1,2,good evening|hello|welcome to Just BLR sir
+Introduction,1,1,2,my name is|i am your happiness server today
+Menu Offering,1,1,1,here is the menu|menu is available|5 star items are our best here
+Assistance Bell,1,1,1,use the bell|call me if you need anything
+Gift Offering,0,1,1,here's a small gift
+Polite Closing,1,1,1,have a good time|thanks for coming|come back again sir
