@@ -5,3 +5,4 @@ rapidfuzz
 nltk
 faster-whisper
 pydub
+requests

@@ -1,463 +1,442 @@
-# app.py — Kavach Lite (Multilingual One-Row SOP Checker)
+# app.py
+# Kavach Lite — One-Row SOP Checker (TXT or Audio ➜ Transcribe ➜ Compare ➜ Tone ➜ Blacklist)
+# Safe, robust, and simple. Works with minimal CSVs and tolerates missing columns.
 
 import io
+import os
 import re
-from typing import List, Set, Tuple, Dict
+import tempfile
+import string
+from typing import List, Tuple
 
-import streamlit as st
 import pandas as pd
+import streamlit as st
 
-# Use rapidfuzz (fast and no external system deps)
-try:
-    from rapidfuzz import fuzz
-except Exception:
-    fuzz = None
-
-# Optional English sentiment (VADER)
-try:
-    import nltk
-    from nltk.sentiment import SentimentIntensityAnalyzer
-    _HAVE_NLTK = True
-except Exception:
-    _HAVE_NLTK = False
-
-
-# -------------------------------
-# UI / Page
-# -------------------------------
+# ---------- CONFIG ----------
 st.set_page_config(page_title="Kavach Lite — One-Row SOP Checker", layout="wide")
+
+
+# ========== UTILITIES ==========
+
+_PUNCT_TBL = str.maketrans("", "", string.punctuation)
+
+def normalize_text(s: str) -> str:
+    """Lowercase, remove punctuation, collapse spaces."""
+    if not isinstance(s, str):
+        s = str(s or "")
+    return re.sub(r"\s+", " ", s.lower().translate(_PUNCT_TBL)).strip()
+
+
+def read_txt(file) -> str:
+    """Read a .txt file object to string safely (utf-8 fallback)."""
+    if file is None:
+        return ""
+    try:
+        return file.read().decode("utf-8", errors="ignore")
+    except AttributeError:
+        # Already str
+        return str(file)
+    except Exception:
+        # Last resort
+        try:
+            return file.read().decode(errors="ignore")
+        except Exception:
+            return ""
+
+
+def try_import_faster_whisper():
+    try:
+        from faster_whisper import WhisperModel
+        return WhisperModel
+    except Exception as e:
+        return None
+
+
+def transcribe_audio(file) -> Tuple[str, str]:
+    """
+    Transcribe audio with faster-whisper if available.
+    Returns (text, message).
+    """
+    WhisperModel = try_import_faster_whisper()
+    if WhisperModel is None:
+        return "", "Whisper not installed. Install with: pip install faster-whisper"
+
+    # Write uploaded audio to a temp path
+    suffix = os.path.splitext(file.name)[-1] or ".wav"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(file.read())
+        tmp_path = tmp.name
+
+    try:
+        # Small/int8 is fast and good enough on CPU
+        model = WhisperModel("small", device="cpu", compute_type="int8")
+        segments, info = model.transcribe(tmp_path, beam_size=1)
+        text = " ".join(seg.text.strip() for seg in segments if seg and seg.text)
+        if not text.strip():
+            return "", "No speech found."
+        return text.strip(), "Audio transcribed successfully with Whisper."
+    except FileNotFoundError as e:
+        # ffmpeg/ffprobe missing
+        return "", f"Transcription failed: {e}. Install ffmpeg: brew install ffmpeg"
+    except Exception as e:
+        return "", f"Transcription failed: {e}"
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+
+# ---------- BLACKLIST MATCHING (phrase + inflection aware) ----------
+
+def detect_blacklist(spoken_text: str, blacklist_terms: List[str]) -> List[str]:
+    """
+    Returns blacklist terms detected in spoken_text.
+    - Multi-word phrases: substring match on normalized text
+    - Single-word: word-boundary regex with optional suffixes (er/ed/ing/s)
+    - Very short terms (<=3 letters): exact word only
+    """
+    norm = normalize_text(spoken_text)
+    hits = set()
+
+    for raw in blacklist_terms:
+        term = normalize_text(str(raw or ""))
+        if not term:
+            continue
+
+        if " " in term:
+            # phrase
+            if term in norm:
+                hits.add(raw)
+            continue
+
+        # single word
+        if len(term) > 3:
+            pattern = r"\b" + re.escape(term) + r"(er|ers|ed|ing|s)?\b"
+        else:
+            pattern = r"\b" + re.escape(term) + r"\b"
+
+        if re.search(pattern, norm):
+            hits.add(raw)
+
+    return sorted(hits)
+
+
+# ---------- SOP PROCESSING ----------
+
+def load_sop_csv(upload) -> pd.DataFrame:
+    """
+    Accepts very flexible SOP CSVs.
+    Supported columns (case-insensitive; optional except 'examples'):
+      - category
+      - required (0/1 or TRUE/FALSE)
+      - min_needed (int)
+      - weight (float)
+      - examples  <-- the example phrases to look for; if missing, try 'example' or 'sop'
+    If 'examples' is absent, we create it from any text-like column found; if none, empty.
+    """
+    if upload is None:
+        return pd.DataFrame()
+
+    try:
+        df = pd.read_csv(upload)
+    except Exception:
+        upload.seek(0)
+        df = pd.read_csv(io.StringIO(upload.read().decode("utf-8", errors="ignore")))
+
+    # Normalize column names
+    df.columns = [c.strip().lower() for c in df.columns]
+
+    # Find an examples-like column
+    examples_col = None
+    for cand in ("examples", "example", "sop", "phrases", "text"):
+        if cand in df.columns:
+            examples_col = cand
+            break
+
+    if examples_col is None:
+        # Create an empty examples column to avoid KeyError
+        df["examples"] = ""
+    else:
+        if examples_col != "examples":
+            df["examples"] = df[examples_col]
+        # Ensure str
+        df["examples"] = df["examples"].fillna("").astype(str)
+
+    # Optional fields with safe defaults
+    if "category" not in df.columns:
+        df["category"] = [f"Step {i+1}" for i in range(len(df))]
+    if "required" not in df.columns:
+        df["required"] = 1
+    if "min_needed" not in df.columns:
+        df["min_needed"] = 1
+    if "weight" not in df.columns:
+        df["weight"] = 1.0
+
+    # Clean types
+    df["required"] = df["required"].apply(lambda x: int(str(x).strip().lower() in ("1", "true", "yes")))
+    df["min_needed"] = pd.to_numeric(df["min_needed"], errors="coerce").fillna(1).astype(int)
+    df["weight"] = pd.to_numeric(df["weight"], errors="coerce").fillna(1.0).astype(float)
+
+    return df[["category", "required", "min_needed", "weight", "examples"]]
+
+
+def count_phrase_hits(spoken: str, phrase_blob: str) -> int:
+    """
+    Given spoken text and a 'phrase blob' (comma/pipe/semicolon separated examples),
+    count how many of those example phrases occur in the spoken text (normalized, substring).
+    """
+    norm_spoken = normalize_text(spoken)
+    if not phrase_blob:
+        return 0
+
+    # Split on common delimiters
+    parts = re.split(r"[|;,]\s*|\n+", str(phrase_blob))
+    parts = [normalize_text(p) for p in parts if normalize_text(p)]
+    if not parts:
+        return 0
+
+    hits = 0
+    for p in parts:
+        if p in norm_spoken:
+            hits += 1
+    return hits
+
+
+def compute_compliance(spoken_text: str, sop_df: pd.DataFrame) -> Tuple[float, pd.DataFrame]:
+    """
+    Compliance score = weighted coverage of SOP rows.
+    For each row: if hits >= min_needed, it's 'covered'. Required rows weigh more implicitly
+    because missing them means 0 for that row.
+    """
+    if sop_df.empty:
+        return 0.0, sop_df
+
+    rows = []
+    total_weight = sop_df["weight"].sum() if sop_df["weight"].sum() > 0 else len(sop_df)
+    covered_weight = 0.0
+
+    for _, row in sop_df.iterrows():
+        hits = count_phrase_hits(spoken_text, row["examples"])
+        covered = int(hits >= max(1, row["min_needed"]))
+        weight = float(row["weight"])
+        if covered:
+            covered_weight += weight
+        rows.append({
+            "category": row["category"],
+            "required": row["required"],
+            "min_needed": row["min_needed"],
+            "weight": weight,
+            "examples": row["examples"],
+            "hits": hits,
+            "covered": covered
+        })
+
+    detail_df = pd.DataFrame(rows)
+    # If you want required rows to be mandatory, you can multiply their weight by 2 (optional)
+    compliance = 0.0 if total_weight <= 0 else (covered_weight / total_weight) * 100.0
+    return round(compliance, 1), detail_df
+
+
+def word_variance(sop_text: str, spoken_text: str) -> Tuple[int, List[str], List[str]]:
+    sop_tokens = set(normalize_text(sop_text).split())
+    spoken_tokens = set(normalize_text(spoken_text).split())
+    only_in_sop = sorted(list(sop_tokens - spoken_tokens))
+    only_in_spoken = sorted(list(spoken_tokens - sop_tokens))
+    uv = len(only_in_sop) + len(only_in_spoken)
+    return uv, only_in_sop, only_in_spoken
+
+
+# ---------- TONE (lightweight heuristic) ----------
+POS = {"please", "thank", "thanks", "welcome", "happy", "kind", "help", "sorry"}
+NEG = {"no", "not", "never", "donot", "dont", "shut", "leave", "complaint", "angry", "hate", "idiot", "stupid"}
+
+def tone_score(spoken: str, blacklist_hits: List[str]) -> Tuple[int, str]:
+    """
+    Simple tone: + for polite markers, - for negatives & blacklist.
+    Bounded 0..100; label bucketed.
+    """
+    norm = normalize_text(spoken)
+    score = 50
+    for w in POS:
+        if w in norm:
+            score += 5
+    for w in NEG:
+        if w in norm:
+            score -= 8
+    # Penalize blacklist hits strongly
+    score -= 12 * len(blacklist_hits)
+
+    score = max(0, min(100, score))
+    if score >= 80:
+        label = "POLITE"
+    elif score >= 50:
+        label = "NEUTRAL"
+    else:
+        label = "RUDE"
+    return score, label
+
+
+# ========== UI ==========
+
 st.title("Kavach Lite — One-Row SOP Checker")
 
-st.caption(
-    "Upload transcript + SOP + Blacklist → EMPLOYEE | SOP TEXT | SPOKEN TEXT | "
-    "BLACKLISTED WORDS | WORD VARIANCE | VARIANCE % | TONE | COMPLIANCE %"
-)
+with st.expander("Quick instructions", expanded=False):
+    st.markdown(
+        """
+**Flow:** Upload **Transcript (.txt)** or **Audio (.wav/.mp3/.m4a)** ➜ Upload **SOP CSV** & **Blacklist CSV** ➜ Click **Rerun** (auto) ➜ See Compliance • Variance • Tone.
 
-# -------------------------------
-# Language Selection
-# -------------------------------
-LANGUAGES = [
-    "English", "Kannada", "Telugu", "Tamil", "Malayalam", "Hindi",
-    "Arabic", "French", "Spanish"
-]
-language = st.selectbox("Select Language", LANGUAGES, index=0)
-st.caption("⚠️ Make sure your transcript, SOP, and blacklist are in the **same language** you select here.")
+**CSV formats:**
+- **SOP CSV** (flexible): columns may include  
+  `category, required, min_needed, weight, examples`  
+  – Only `examples` (phrases) is really needed. Others default safely.
+- **Blacklist CSV**: **header exactly `term`**, one term/phrase per row.
 
-# -------------------------------
-# Sidebar: Employee Inputs + Uploaders
-# -------------------------------
-with st.sidebar:
-    st.header("Upload")
-    emp_name = st.text_input("Employee name", value="jhony")
-    emp_id = st.text_input("Employee ID", value="EMP001")
-
-    st.subheader("Transcript (.txt)")
-    txt_file = st.file_uploader(
-        "Drag and drop file here",
-        type=["txt"],
-        key="upl_txt",
-        label_visibility="collapsed"
+**Audio:** requires `ffmpeg` and `faster-whisper`.  
+Install: `brew install ffmpeg`  and  `pip install faster-whisper`
+        """
     )
 
-    st.subheader("SOP CSV")
-    sop_file = st.file_uploader(
-        "Drag and drop file here",
-        type=["csv"],
-        key="upl_sop",
-        label_visibility="collapsed",
-        help="CSV with columns: category/description, examples (split by |), required (0/1), min_needed, weight"
-    )
+# Basic identity (free text for UI)
+colA, colB = st.columns(2)
+with colA:
+    employee_name = st.text_input("Employee name", "John Smith")
+with colB:
+    employee_id = st.text_input("Employee ID", "EMP001")
 
-    st.subheader("Blacklist CSV")
-    bl_file = st.file_uploader(
-        "Drag and drop file here",
-        type=["csv"],
-        key="upl_bl",
-        label_visibility="collapsed",
-        help="First column is treated as list of blacklisted words/phrases"
-    )
+st.subheader("Transcript (.txt) **OR** Audio")
 
+col1, col2 = st.columns(2)
+with col1:
+    txt_file = st.file_uploader("Drag and drop .txt here", type=["txt"], help="Upload transcript as plain text")
 
-# -------------------------------
-# Helpers (Language-aware)
-# -------------------------------
-def normalize_text(s: str) -> str:
-    """Normalize text depending on selected language (lowercase + keep script range)."""
-    if not isinstance(s, str):
-        return ""
-    s = s.lower().strip()
+with col2:
+    audio_file = st.file_uploader("Or upload audio (.wav, .mp3, .m4a)", type=["wav", "mp3", "m4a"])
 
-    if language in ["English", "French", "Spanish"]:
-        # keep latin letters, digits, underscore, apostrophes, and whitespace
-        s = re.sub(r"[^\w\s']", " ", s)
-        s = re.sub(r"\s+", " ", s).strip()
+# SOP + Blacklist uploaders
+st.subheader("SOP & Blacklist")
+c3, c4 = st.columns(2)
+with c3:
+    sop_upload = st.file_uploader("Upload SOP CSV", type=["csv"], key="sop_csv")
+with c4:
+    bl_upload = st.file_uploader("Upload Blacklist CSV", type=["csv"], key="bl_csv")
 
-    elif language in ["Kannada", "Telugu", "Tamil", "Malayalam", "Hindi"]:
-        # Hindi (Devanagari \u0900) through Malayalam (\u0D7F)
-        s = re.sub(r"[^\u0900-\u0D7F\s]", " ", s)
-        s = re.sub(r"\s+", " ", s).strip()
+# ---------- LOAD INPUTS ----------
+spoken_text = ""
+msg = ""
 
-    elif language == "Arabic":
-        s = re.sub(r"[^\u0600-\u06FF\s]", " ", s)
-        s = re.sub(r"\s+", " ", s).strip()
+if txt_file is not None and txt_file.size > 0:
+    spoken_text = read_txt(txt_file).strip()
+    msg = "Transcript loaded."
+elif audio_file is not None and audio_file.size > 0:
+    spoken_text, msg = transcribe_audio(audio_file)
 
-    else:
-        # default: be permissive
-        s = re.sub(r"\s+", " ", s).strip()
+if msg:
+    st.info(msg)
 
-    return s
+# SOP
+sop_df = load_sop_csv(sop_upload)
 
-
-def tokenize_set(s: str) -> Set[str]:
-    """Split into unique tokens (space-separated). Keeps language-specific script."""
-    s = normalize_text(s)
-    return set([tok for tok in s.split(" ") if tok])
-
-
-def parse_examples_cell(cell: str) -> List[str]:
-    """Parse examples string from SOP CSV. Expected as 'a|b|c'. Also handles lists and commas."""
-    if not isinstance(cell, str):
-        return []
-    cell = cell.strip()
-
-    # If like ["a","b"] or ['a','b']
-    if (cell.startswith("[") and cell.endswith("]")) or (cell.startswith("(") and cell.endswith(")")):
-        # strip brackets
-        raw = cell[1:-1]
-        parts = re.split(r"[|,]", raw)
-        return [normalize_text(p.strip().strip("'").strip('"')) for p in parts if p.strip()]
-
-    # default split by |
-    parts = [p.strip() for p in cell.split("|")]
-    return [normalize_text(p) for p in parts if p]
-
-
-def tone_from_text(spoken: str) -> str:
-    """Tone classification: English → VADER; others → NEUTRAL placeholder."""
-    if language != "English":
-        return "NEUTRAL"
-
-    if not _HAVE_NLTK:
-        return "NEUTRAL"
-
-    # Ensure VADER is available (silent if already downloaded)
+# Blacklist
+black_terms: List[str] = []
+if bl_upload is not None:
     try:
-        nltk.data.find("sentiment/vader_lexicon.zip")
+        bl_df = pd.read_csv(bl_upload)
     except Exception:
-        try:
-            nltk.download("vader_lexicon", quiet=True)
-        except Exception:
-            return "NEUTRAL"
+        bl_upload.seek(0)
+        bl_df = pd.read_csv(io.StringIO(bl_upload.read().decode("utf-8", errors="ignore")))
+    # require column named 'term'
+    bl_df.columns = [c.strip().lower() for c in bl_df.columns]
+    if "term" not in bl_df.columns:
+        st.warning("Could not read Blacklist CSV: must have column **term**.")
+        bl_df = pd.DataFrame({"term": []})
+    black_terms = [t for t in bl_df["term"].astype(str).tolist() if str(t).strip()]
 
-    try:
-        sia = SentimentIntensityAnalyzer()
-        ss = sia.polarity_scores(spoken or "")
-        if ss["compound"] >= 0.35:
-            return "POLITE"
-        if ss["compound"] <= -0.35:
-            return "RUDE"
-        return "NEUTRAL"
-    except Exception:
-        return "NEUTRAL"
-
-
-def best_fuzzy_match(spoken: str, examples: List[str]) -> Tuple[str, int]:
-    """Return (best_example, best_score) using rapidfuzz partial_ratio."""
-    if not examples:
-        return ("", 0)
-    if fuzz is None:
-        # graceful fallback: simple containment check
-        s = normalize_text(spoken)
-        best = 0
-        best_ex = ""
-        for ex in examples:
-            if ex and ex in s:
-                score = 100
-            else:
-                score = 0
-            if score > best:
-                best = score
-                best_ex = ex
-        return (best_ex, best)
-
-    s = normalize_text(spoken)
-    best = 0
-    best_ex = ""
-    for ex in examples:
-        score = fuzz.partial_ratio(s, ex)
-        if score > best:
-            best = score
-            best_ex = ex
-    return (best_ex, int(best))
-
-
-def find_blacklisted(spoken: str, bl_words: List[str]) -> List[str]:
-    """Return list of blacklisted words/phrases found in spoken text."""
-    found = []
-    text_norm = normalize_text(spoken)
-    for w in bl_words:
-        w_norm = normalize_text(str(w))
-        if not w_norm:
-            continue
-        # Use approximate containment by words (regex); for non-latin, a simple 'in' is ok
-        try:
-            # For Latin alphabets, use word boundaries where available
-            if language in ["English", "French", "Spanish"]:
-                pattern = r"\b" + re.escape(w_norm) + r"\b"
-                if re.search(pattern, text_norm):
-                    found.append(w)
-            else:
-                if w_norm in text_norm:
-                    found.append(w)
-        except Exception:
-            if w_norm in text_norm:
-                found.append(w)
-    # unique preserve order
-    seen = set()
-    uniq = []
-    for x in found:
-        if x not in seen:
-            uniq.append(x)
-            seen.add(x)
-    return uniq
-
-
-def highlight_blacklist(spoken: str, bl_words: List[str]) -> str:
-    """Wrap blacklist words in a red badge."""
-    marked = normalize_text(spoken)
-
-    # Replace longer words first to avoid partial overlaps
-    words_sorted = sorted([normalize_text(str(w)) for w in bl_words if str(w).strip()], key=len, reverse=True)
-
-    for w in words_sorted:
-        if not w:
-            continue
-        try:
-            if language in ["English", "French", "Spanish"]:
-                pattern = r"(?<!<span[^>]*>)\b" + re.escape(w) + r"\b"
-            else:
-                pattern = re.escape(w)
-            marked = re.sub(
-                pattern,
-                rf"<span class='bl-badge'>{w}</span>",
-                marked,
-                flags=re.IGNORECASE,
-            )
-        except Exception:
-            marked = marked.replace(w, f"<span class='bl-badge'>{w}</span>")
-
-    return marked
-
-
-# -------------------------------
-# CSS for badges / table chips
-# -------------------------------
-st.markdown(
-    """
-    <style>
-      .metric-chip {
-        display:inline-block; padding:4px 10px; border-radius:16px; font-weight:600;
-        font-size:12px; background:#111; border:1px solid #333;
-      }
-      .chip-green { background:#0b3d19; border-color:#2b7a3d; color:#c9f7d9; }
-      .chip-amber { background:#3d2b0b; border-color:#7a5a2b; color:#ffe1a6; }
-      .chip-red   { background:#3d0b0b; border-color:#7a2b2b; color:#ffc9c9; }
-
-      .bl-badge {
-        background:#3d0b0b; color:#ffc9c9; padding:2px 6px; border-radius:8px;
-        border:1px solid #7a2b2b; margin:0 2px; display:inline-block;
-      }
-      .ok-badge {
-        background:#0b3d19; color:#c9f7d9; padding:2px 6px; border-radius:8px;
-        border:1px solid #2b7a3d; font-size:12px;
-      }
-      .no-badge {
-        background:#3d0b0b; color:#ffc9c9; padding:2px 6px; border-radius:8px;
-        border:1px solid #7a2b2b; font-size:12px;
-      }
-      .small-note { font-size:12px; opacity:0.8; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-# -------------------------------
-# Main Logic (after uploads)
-# -------------------------------
-if not (txt_file and sop_file and bl_file):
-    st.info("Upload a **Transcript (.txt)**, an **SOP CSV**, and a **Blacklist CSV** to begin.")
-    st.stop()
-
-try:
-    transcript = txt_file.read().decode("utf-8", errors="ignore")
-except Exception:
-    transcript = io.TextIOWrapper(txt_file, encoding="utf-8", errors="ignore").read()
-
-# SOP CSV
-sop_df = pd.read_csv(sop_file)
-sop_df.columns = [c.strip().lower() for c in sop_df.columns]
-
-# Try to be forgiving on column names
-def first_col(options: List[str], df_cols: List[str]) -> str:
-    for o in options:
-        if o in df_cols:
-            return o
-    return ""
-
-col_category = first_col(["category", "description", "item", "label"], sop_df.columns) or "category"
-col_examples = first_col(["examples", "phrases", "samples"], sop_df.columns) or "examples"
-col_required = first_col(["required", "is_required", "must"], sop_df.columns) or "required"
-col_min = first_col(["min_needed", "min_count", "min"], sop_df.columns) or "min_needed"
-col_weight = first_col(["weight", "score", "points"], sop_df.columns) or "weight"
-
-# Fill defaults where missing
-if col_required not in sop_df:
-    sop_df[col_required] = 1
-if col_min not in sop_df:
-    sop_df[col_min] = 1
-if col_weight not in sop_df:
-    sop_df[col_weight] = 1
-if col_category not in sop_df:
-    sop_df[col_category] = [f"Step {i+1}" for i in range(len(sop_df))]
-if col_examples not in sop_df:
-    sop_df[col_examples] = ""
-
-# Normalize numeric fields
-for c in [col_required, col_min, col_weight]:
-    sop_df[c] = pd.to_numeric(sop_df[c], errors="coerce").fillna(1).astype(int)
-
-# Build SOP rows
-sop_rows: List[Dict] = []
-all_sop_words: Set[str] = set()
-
-for _, row in sop_df.iterrows():
-    cat = str(row[col_category]).strip()
-    examples = parse_examples_cell(str(row[col_examples]))
-    req = int(row[col_required]) if pd.notna(row[col_required]) else 1
-    min_need = int(row[col_min]) if pd.notna(row[col_min]) else 1
-    w = int(row[col_weight]) if pd.notna(row[col_weight]) else 1
-
-    for ex in examples:
-        all_sop_words |= tokenize_set(ex)
-
-    sop_rows.append({
-        "category": cat,
-        "examples": examples,
-        "required": 1 if req else 0,
-        "min_needed": max(1, min_need),
-        "weight": max(1, w),
-    })
-
-# Blacklist CSV: treat first column as blacklisted words/phrases
-bl_df = pd.read_csv(bl_file)
-bl_df.columns = [c.strip().lower() for c in bl_df.columns]
-bl_words = bl_df.iloc[:, 0].astype(str).fillna("").tolist()
-
-# Calculate metrics
-spoken_text = transcript.strip()
-spoken_norm = normalize_text(spoken_text)
-spoken_tokens = tokenize_set(spoken_text)
-
-# Per-row fuzzy
-FUZZ_THRESHOLD = 85
-details = []
-req_weight_total = sum(r["weight"] for r in sop_rows if r["required"] == 1)
-req_weight_hit = 0
-
-for r in sop_rows:
-    best_ex, best_score = best_fuzzy_match(spoken_text, r["examples"])
-    # count hits above threshold as 1 (simple)
-    hit_count = 1 if best_score >= FUZZ_THRESHOLD else 0
-    satisfied = (hit_count >= r["min_needed"])
-
-    if r["required"] == 1 and satisfied:
-        req_weight_hit += r["weight"]
-
-    details.append({
-        "category": r["category"],
-        "required": r["required"],
-        "min_needed": r["min_needed"],
-        "weight": r["weight"],
-        "hit_count": hit_count,
-        "best_example_match": best_ex,
-        "best_fuzzy_score": best_score,
-        "satisfied": "✅" if satisfied else "✖️",
-    })
-
-# Word variance = proportion of transcript words NOT seen anywhere in SOP examples
-# (Set-based; language-aware tokenization)
-if all_sop_words:
-    diff = spoken_tokens - all_sop_words
-    word_variance_pct = 100.0 * len(diff) / max(1, len(spoken_tokens))
+# ---------- BUILD SOP TEXT (for variance table only) ----------
+# Compact SOP 'examples' into a readable single line for the table
+if not sop_df.empty:
+    sop_compact = " • ".join(
+        [normalize_text(x) for x in sop_df["examples"].fillna("").astype(str).tolist() if normalize_text(x)]
+    )
 else:
-    word_variance_pct = 100.0  # no SOP words => everything varies
+    sop_compact = ""
 
-# Compliance % = weighted coverage of required rows
-compliance_pct = 100.0 * req_weight_hit / max(1, req_weight_total)
+# ---------- METRICS ----------
+compliance = 0.0
+variance_pct = 0.0
+tone = 50
+tone_label = "NEUTRAL"
+bl_hits: List[str] = []
 
-# Tone
-tone_label = tone_from_text(spoken_text)
+if spoken_text.strip():
+    # Blacklist
+    bl_hits = detect_blacklist(spoken_text, black_terms)
+    # Compliance
+    compliance, sop_detail = compute_compliance(spoken_text, sop_df) if not sop_df.empty else (0.0, pd.DataFrame())
+    # Variance
+    uv_count, only_in_sop, only_in_spoken = word_variance(sop_compact, spoken_text)
+    # Variance% is a soft indicator; we can normalize by len(sop words)+len(spoken words)
+    denom = max(1, len(set(normalize_text(sop_compact).split())) + len(set(normalize_text(spoken_text).split())))
+    variance_pct = round((uv_count / denom) * 100.0, 1)
+    # Tone
+    tone, tone_label = tone_score(spoken_text, bl_hits)
 
-# Blacklisted words found
-bl_found = find_blacklisted(spoken_text, bl_words)
+# ---------- KPI STRIP ----------
+k1, k2, k3 = st.columns(3)
+with k1:
+    st.metric("Compliance %", f"{compliance:.1f}%")
+with k2:
+    st.metric("Variance %", f"{variance_pct:.1f}%")
+with k3:
+    st.metric("Tone score", f"{tone} ({tone_label})")
 
-# Highlight transcript with blacklist
-highlighted = highlight_blacklist(spoken_text, bl_found)
-
-
-# -------------------------------
-# Summary Header
-# -------------------------------
-st.header("Summary")
-
+# ---------- SUMMARY TABLE ----------
+st.subheader("Summary")
 summary_df = pd.DataFrame([{
-    "EMPLOYEE": f"{emp_name} {emp_id}",
-    "SOP TEXT": " | ".join([r["category"] for r in sop_rows]),
-    "SPOKEN TEXT": spoken_text[:1000],  # preview
+    "EMPLOYEE": f"{employee_name} {employee_id}",
+    "SOP TEXT": sop_compact,
+    "SPOKEN TEXT": spoken_text if spoken_text else "—"
 }])
-
-# Clean display
 st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
-colA, colB, colC, colD = st.columns(4)
-with colA:
-    st.metric("WORD VARIANCE", f"{word_variance_pct:.1f}%")
-with colB:
-    tone_class = (
-        "chip-green" if tone_label == "POLITE"
-        else "chip-red" if tone_label == "RUDE"
-        else "chip-amber"
-    )
-    st.markdown(f"<span class='metric-chip {tone_class}'>{tone_label}</span>", unsafe_allow_html=True)
-with colC:
-    st.metric("COMPLIANCE", f"{compliance_pct:.1f}%")
-with colD:
-    bl_text = "—" if not bl_found else ", ".join(bl_found)
-    st.write("**BLACKLISTED WORDS**")
-    st.write(bl_text)
+# ---------- DETAILS ----------
+with st.expander("SOP Details (per row)", expanded=False):
+    if spoken_text and not sop_df.empty:
+        show = sop_detail[["category", "required", "min_needed", "weight", "examples", "hits", "covered"]].copy()
+        show.rename(columns={
+            "category": "Category",
+            "required": "Required",
+            "min_needed": "Min hits",
+            "weight": "Weight",
+            "examples": "Examples",
+            "hits": "Hits",
+            "covered": "Covered"
+        }, inplace=True)
+        st.dataframe(show, use_container_width=True, hide_index=True)
+    else:
+        st.info("Upload SOP CSV and transcript/audio to see per-row coverage.")
 
+with st.expander("Word Variance Terms", expanded=False):
+    if spoken_text:
+        cL, cR = st.columns(2)
+        with cL:
+            st.caption("In SOP but not Spoken")
+            st.write(", ".join(only_in_sop) if sop_compact else "—")
+        with cR:
+            st.caption("In Spoken but not SOP")
+            st.write(", ".join(only_in_spoken) if spoken_text else "—")
+        st.caption(f"Unique word variance count: {len(only_in_sop) + len(only_in_spoken)}")
+    else:
+        st.info("Upload transcript or audio to see variance.")
 
-# -------------------------------
-# Transcript (highlighted)
-# -------------------------------
-st.subheader("Transcript (highlighted)")
-st.markdown(highlighted, unsafe_allow_html=True)
+with st.expander("Blacklist Hits", expanded=False):
+    if bl_hits:
+        st.error(", ".join(bl_hits))
+    else:
+        st.success("No blacklisted words detected.")
 
-# -------------------------------
-# SOP Details (per row)
-# -------------------------------
-st.subheader("SOP Details (per row)")
-details_df = pd.DataFrame(details)
-details_df = details_df[[
-    "category", "required", "min_needed", "weight",
-    "hit_count", "best_example_match", "best_fuzzy_score", "satisfied"
-]]
-st.dataframe(details_df, use_container_width=True, hide_index=True)
-
-st.markdown(
-    "<div class='small-note'>"
-    "MATCH threshold = 0.85  |  VARIANCE % = word set difference vs SOP words  |  "
-    "COMPLIANCE % = weighted coverage of required SOP rows</div>",
-    unsafe_allow_html=True,
+# ---------- FOOTER TIP ----------
+st.caption(
+    "Tip: Improve SOP matching by writing examples as short phrases (comma, pipe, or semicolon separated). "
+    "Audio quality and speaking style impact transcription accuracy."
 )
